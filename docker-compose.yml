@@ -1,0 +1,33 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: examguard
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    restart: always
+    depends_on: [postgres]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/examguard?schema=public
+      JWT_SECRET: super_secret_jwt_key_examguard
+      PORT: 4000
+      NODE_ENV: production
+    ports: ["4000:4000"]
+    command: sh -c "npx prisma migrate deploy && node prisma/seed.js && npm start"
+
+  frontend:
+    build: ./frontend
+    restart: always
+    depends_on: [backend]
+    ports: ["5173:80"]
+
+volumes:
+  pgdata:
