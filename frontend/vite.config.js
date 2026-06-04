@@ -7,8 +7,9 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 5173,
     proxy: {
+      // Работает только в dev; в production используется VITE_API_URL
       '/api': {
-        target: process.env.VITE_API_URL || 'http://localhost:4000',
+        target: 'http://localhost:4000',
         changeOrigin: true,
       },
     },

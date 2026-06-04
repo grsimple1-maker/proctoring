@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ExamGuard Proctor - система онлайн-экзаменов</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    html { scroll-behavior: smooth; }
+    video { transform: scaleX(-1); }
+    @media print {
+      .no-print { display: none !important; }
+      body { background: #fff !important; color: #111827 !important; }
+      .print-panel { border: 1px solid #d1d5db !important; background: #fff !important; color: #111827 !important; }
+    }
+  </style>
+</head>
+<body class="bg-[#0d1117] text-slate-100 antialiased">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState } = React;
+
+    const seedTests = [
+      {
+        id: "test-sql",
+        title: "Основы SQL",
+        subject: "Базы данных",
+        startDate: new Date().toISOString().slice(0, 10),
+        startTime: "08:00",
+        endTime: "23:59",
+        duration: 60,
+        questions: [
+          {
+            text: "Какой оператор используется для выборки данных из таблицы?",
+            answers: ["INSERT", "SELECT", "UPDATE", "DROP"],
+            correct: 1
+          },
+          {
+            text: "Как называется ограничение для уникального значения в столбце?",
+            answers: ["PRIMARY KEY", "TEXT", "ORDER BY", "JOIN"],
+            correct: 0
+          }
+        ]
+      },
+      {
+        id: "test-web",
+        title: "Веб-разработка",
+        subject: "Frontend",
+        startDate: new Date().toISOString().slice(0, 10),
+        startTime: "08:00",
+        endTime: "23:59",
+        duration: 45,
+        questions: [
+          {
+            text: "Какой хук React используется для локального состояния компонента?",
+            answers: ["useState", "useRoute", "useServer", "useTable"],
+            correct: 0
+          }
+        ]
+      }
+    ];
+
+    const seedUsers = [
+      { id: "u-teacher", name: "Иван Петров", email: "teacher@test.ru", passwordHash: "seed:123", role: "teacher" },
+      { id: "u-student", name: "Анна Соколова", email: "student@test.ru", passwordHash: "seed:123", role: "student" }
+    ];
+
+    const storage = {
+      get(key, fallback) {
+        try {
+          return JSON.parse(localStorage.getItem(key)) ?? fallback;
+        } catch {
+          return fallback;
+        }
+      },
+      set(key, value) {
+        localStorage.setItem(key, JSON.stringify(value));
+      }
+    };
+
+    function initStorage() {
+      if (!localStorage.getItem("eg_users")) storage.set("eg_users", seedUsers);
+      if (!localStorage.getItem("eg_tests")) storage.set("eg_tests", seedTests);
+      if (!localStorage.getItem("eg_results")) {
+        storage.set("eg_results", [
+          {
+            id: crypto.randomUUID(),
+            studentName: "Анна Соколова",
+            testTitle: "Основы SQL",
+            score: 100,
+            total: 100,
+            warnings: 0,
+            status: "Экзамен завершён успешно",
+            events: ["Экзамен завершён штатно"],
+            finishedAt: new Date().toLocaleString("ru-RU")
+          }
+        ]);
+      }
+    }
+
+    async function hashPassword(password) {
+      if (password === "123") return "seed:123";
+      const bytes = new TextEncoder().encode(password);
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function createJwtLikeToken(user) {
+      const payload = btoa(unescape(encodeURIComponent(JSON.stringify({
+        sub: user.id,
+        role: user.role,
+        email: user.email,
+        exp: Date.now() + 1000 * 60 * 60 * 8
+      }))));
+      return `demo-header.${payload}.demo-signature`;
+    }
+
+    function testWindow(test) {
+      const start = new Date(`${test.startDate}T${test.startTime || "00:00"}`);
+      const end = new Date(`${test.startDate}T${test.endTime || "23:59"}`);
+      const now = new Date();
+      if (now < start) return { status: "scheduled", label: "Откроется по расписанию" };
+      if (now > end) return { status: "closed", label: "Доступ закрыт" };
+      return { status: "open", label: "Доступен" };
+    }
+
+    function Button({ children, className = "", variant = "primary", ...props }) {
+      const variants = {
+        primary: "bg-teal-400 text-slate-950 hover:bg-teal-300",
+        ghost: "border border-slate-700 text-slate-100 hover:border-teal-300 hover:text-teal-200",
+        danger: "bg-red-500 text-white hover:bg-red-400",
+        soft: "bg-slate-800 text-slate-100 hover:bg-slate-700"
+      };
+      return (
+        <button className={`rounded-md px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${variants[variant]} ${className}`} {...props}>
+          {children}
+        </button>
+      );
+    }
+
+    function Field({ label, children }) {
+      return (
+        <label className="block">
+          <span className="mb-1 block text-sm text-slate-300">{label}</span>
+          {children}
+        </label>
+      );
+    }
+
+    const inputClass = "w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none transition focus:border-teal-300";
+
+    function StatCard({ label, value, note, tone = "teal" }) {
+      const tones = {
+        teal: "text-teal-300",
+        amber: "text-amber-300",
+        red: "text-red-300",
+        slate: "text-slate-100"
+      };
+      return (
+        <div className="rounded-md border border-slate-800 bg-slate-900 p-5">
+          <div className={`text-3xl font-black ${tones[tone]}`}>{value}</div>
+          <div className="mt-2 text-sm font-semibold text-white">{label}</div>
+          {note && <div className="mt-1 text-xs leading-5 text-slate-400">{note}</div>}
+        </div>
+      );
+    }
+
+    function StatusPill({ children, danger = false, muted = false }) {
+      const className = danger
+        ? "bg-red-500/10 text-red-200 border-red-500/30"
+        : muted
+          ? "bg-slate-800 text-slate-300 border-slate-700"
+          : "bg-teal-400/10 text-teal-200 border-teal-400/30";
+      return <span className={`inline-flex rounded-md border px-2 py-1 text-xs font-semibold ${className}`}>{children}</span>;
+    }
+
+    function App() {
+      const [page, setPage] = useState("home");
+      const [users, setUsers] = useState([]);
+      const [tests, setTests] = useState([]);
+      const [results, setResults] = useState([]);
+      const [currentUser, setCurrentUser] = useState(null);
+      const [activeTest, setActiveTest] = useState(null);
+
+      useEffect(() => {
+        initStorage();
+        setUsers(storage.get("eg_users", []));
+        setTests(storage.get("eg_tests", []));
+        setResults(storage.get("eg_results", []));
+        const session = storage.get("eg_session", null);
+        if (session?.user) setCurrentUser(session.user);
+      }, []);
+
+      function persistUsers(next) {
+        setUsers(next);
+        storage.set("eg_users", next);
+      }
+
+      function persistTests(next) {
+        setTests(next);
+        storage.set("eg_tests", next);
+      }
+
+      function persistResults(next) {
+        setResults(next);
+        storage.set("eg_results", next);
+      }
+
+      function openDashboard(user = currentUser) {
+        setPage(user?.role === "teacher" ? "teacher" : "student");
+      }
+
+      function logout() {
+        localStorage.removeItem("eg_session");
+        setCurrentUser(null);
+        setActiveTest(null);
+        setPage("home");
+      }
+
+      function startExam(test) {
+        setActiveTest(test);
+        setPage("exam");
+      }
+
+      function finishExam(result) {
+        const next = [result, ...results];
+        persistResults(next);
+        setActiveTest(null);
+        if (result.status.includes("наруш")) {
+          logout();
+        } else {
+          setPage("student");
+        }
+      }
+
+      return (
+        <div className="min-h-screen">
+          <Header page={page} setPage={setPage} currentUser={currentUser} logout={logout} openDashboard={openDashboard} />
+          {page === "home" && <Home setPage={setPage} />}
+          {page === "login" && <Login users={users} setCurrentUser={setCurrentUser} setPage={setPage} />}
+          {page === "register" && <Register users={users} persistUsers={persistUsers} setPage={setPage} />}
+          {page === "teacher" && <TeacherDashboard users={users} tests={tests} results={results} persistUsers={persistUsers} persistTests={persistTests} persistResults={persistResults} />}
+          {page === "student" && <StudentDashboard currentUser={currentUser} tests={tests} results={results} startExam={startExam} />}
+          {page === "exam" && activeTest && <Exam currentUser={currentUser} test={activeTest} finishExam={finishExam} />}
+          <Footer />
+        </div>
+      );
+    }
+
+    function Header({ page, setPage, currentUser, logout, openDashboard }) {
+      return (
+        <header className="no-print sticky top-0 z-40 border-b border-slate-800 bg-[#0d1117]/90 backdrop-blur">
+          <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
+            <button onClick={() => setPage("home")} className="flex items-center gap-3 text-left">
+              <span className="grid h-10 w-10 place-items-center rounded-md bg-teal-400 text-lg font-black text-slate-950">EG</span>
+              <div>
+                <div className="text-base font-bold tracking-wide">ExamGuard Proctor</div>
+                <div className="text-xs text-slate-400">Онлайн-экзамены и прокторинг</div>
+              </div>
+            </button>
+            <div className="flex items-center gap-2">
+              {currentUser ? (
+                <>
+                  <button onClick={() => openDashboard()} className="rounded-md bg-slate-900 px-3 py-2 text-sm text-teal-200">
+                    <span className="sm:hidden">Кабинет</span>
+                    <span className="hidden sm:inline">{currentUser.name} · {currentUser.role === "teacher" ? "Преподаватель" : "Студент"}</span>
+                  </button>
+                  <Button variant="ghost" onClick={logout}>Выйти</Button>
+                </>
+              ) : (
+                <>
+                  <Button variant="ghost" onClick={() => setPage("login")}>Войти</Button>
+                  <Button onClick={() => setPage("register")}>Регистрация</Button>
+                </>
+              )}
+            </div>
+          </div>
+        </header>
+      );
+    }
+
+    function Home({ setPage }) {
+      const advantages = [
+        ["Автоматическое расписание", "Тесты открываются и закрываются строго по заданным дате и времени."],
+        ["Прокторинг в браузере", "Веб-камера, контроль вкладок, фиксация отключения камеры и потери фокуса."],
+        ["Журнал нарушений", "Каждое предупреждение сохраняется в отчёте преподавателя."],
+        ["Экспорт результатов", "Доступны отчёты в Excel и печатная PDF-форма через браузер."]
+      ];
+      return (
+        <main>
+          <section className="mx-auto grid max-w-7xl gap-10 px-4 py-12 lg:grid-cols-[1.05fr_0.95fr] lg:py-16">
+            <div className="flex flex-col justify-center">
+              <div className="mb-4 inline-flex w-fit rounded-md border border-teal-400/30 bg-teal-400/10 px-3 py-1 text-sm text-teal-200">
+                Платформа для безопасного онлайн-тестирования
+              </div>
+              <h1 className="max-w-3xl text-4xl font-black leading-tight text-white sm:text-5xl lg:text-6xl">
+                Система онлайн-экзаменов с функцией прокторинга
+              </h1>
+              <p className="mt-5 max-w-2xl text-lg leading-8 text-slate-300">
+                Веб-платформа для проведения экзаменов студентов с автоматическим контролем времени, сохранением ответов и фиксацией нарушений во время тестирования.
+              </p>
+              <div className="mt-8 flex flex-wrap gap-3">
+                <Button className="px-6 py-3" onClick={() => setPage("login")}>Войти</Button>
+                <Button className="px-6 py-3" variant="ghost" onClick={() => setPage("register")}>Регистрация</Button>
+              </div>
+            </div>
+            <div className="grid content-start gap-4">
+              <div className="rounded-md border border-slate-800 bg-slate-900 p-5">
+                <div className="text-sm font-semibold text-teal-200">Информационный баннер</div>
+                <div className="mt-2 text-2xl font-bold">Контроль экзамена в реальном времени</div>
+                <p className="mt-2 text-slate-400">Таймер, статусы доступа и предупреждения работают автоматически на стороне клиента. Backend-слой предполагает Node.js, Express.js, PostgreSQL и JWT.</p>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="rounded-md border border-slate-800 bg-slate-900 p-5">
+                  <div className="text-3xl font-black text-teal-300">3</div>
+                  <div className="mt-1 text-sm text-slate-400">предупреждения до автоматического завершения</div>
+                </div>
+                <div className="rounded-md border border-slate-800 bg-slate-900 p-5">
+                  <div className="text-3xl font-black text-teal-300">24/7</div>
+                  <div className="mt-1 text-sm text-slate-400">доступ преподавателя к журналу результатов</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section className="border-y border-slate-800 bg-slate-950/60">
+            <div className="mx-auto grid max-w-7xl gap-4 px-4 py-8 md:grid-cols-4">
+              {advantages.map(([title, text]) => (
+                <div key={title} className="rounded-md border border-slate-800 bg-[#0d1117] p-5">
+                  <h3 className="font-bold text-white">{title}</h3>
+                  <p className="mt-2 text-sm leading-6 text-slate-400">{text}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+        </main>
+      );
+    }
+
+    function Login({ users, setCurrentUser, setPage }) {
+      const [email, setEmail] = useState("teacher@test.ru");
+      const [password, setPassword] = useState("123");
+      const [error, setError] = useState("");
+
+      async function submit(e) {
+        e.preventDefault();
+        const passwordHash = await hashPassword(password);
+        const user = users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.passwordHash === passwordHash);
+        if (!user) {
+          setError("Неверный email или пароль.");
+          return;
+        }
+        const session = { user, token: createJwtLikeToken(user) };
+        storage.set("eg_session", session);
+        setCurrentUser(user);
+        setPage(user.role === "teacher" ? "teacher" : "student");
+      }
+
+      return (
+        <AuthShell title="Вход в систему">
+          <form onSubmit={submit} className="space-y-4">
+            <Field label="Email"><input className={inputClass} type="email" value={email} onChange={e => setEmail(e.target.value)} required /></Field>
+            <Field label="Пароль"><input className={inputClass} type="password" value={password} onChange={e => setPassword(e.target.value)} required /></Field>
+            {error && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">{error}</div>}
+            <Button className="w-full py-3">Войти</Button>
+            <p className="text-center text-xs text-slate-400">Демо: teacher@test.ru / 123 или student@test.ru / 123</p>
+          </form>
+        </AuthShell>
+      );
+    }
+
+    function Register({ users, persistUsers, setPage }) {
+      const [form, setForm] = useState({ name: "", email: "", password: "", confirm: "" });
+      const [error, setError] = useState("");
+
+      function change(key, value) {
+        setForm(prev => ({ ...prev, [key]: value }));
+      }
+
+      async function submit(e) {
+        e.preventDefault();
+        if (form.password.length < 3) return setError("Пароль должен содержать минимум 3 символа.");
+        if (form.password !== form.confirm) return setError("Пароли не совпадают.");
+        if (users.some(u => u.email.toLowerCase() === form.email.toLowerCase())) return setError("Пользователь с таким email уже зарегистрирован.");
+        const user = {
+          id: crypto.randomUUID(),
+          name: form.name.trim(),
+          email: form.email.trim(),
+          role: "student",
+          passwordHash: await hashPassword(form.password)
+        };
+        persistUsers([...users, user]);
+        setPage("login");
+      }
+
+      return (
+        <AuthShell title="Регистрация студента">
+          <form onSubmit={submit} className="space-y-4">
+            <Field label="ФИО"><input className={inputClass} value={form.name} onChange={e => change("name", e.target.value)} required /></Field>
+            <Field label="Email"><input className={inputClass} type="email" value={form.email} onChange={e => change("email", e.target.value)} required /></Field>
+            <Field label="Пароль"><input className={inputClass} type="password" value={form.password} onChange={e => change("password", e.target.value)} required /></Field>
+            <Field label="Подтверждение пароля"><input className={inputClass} type="password" value={form.confirm} onChange={e => change("confirm", e.target.value)} required /></Field>
+            {error && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">{error}</div>}
+            <Button className="w-full py-3">Зарегистрироваться</Button>
+            <p className="text-center text-xs text-slate-400">Публичная регистрация создаёт только аккаунт студента. Аккаунты преподавателей создаются в кабинете преподавателя.</p>
+          </form>
+        </AuthShell>
+      );
+    }
+
+    function AuthShell({ title, children }) {
+      return (
+        <main className="mx-auto max-w-md px-4 py-12">
+          <div className="rounded-md border border-slate-800 bg-slate-900 p-6">
+            <h1 className="mb-6 text-center text-2xl font-bold text-white">{title}</h1>
+            {children}
+          </div>
+        </main>
+      );
+    }
+
+    function TeacherDashboard({ users, tests, results, persistUsers, persistTests, persistResults }) {
+      const emptyQuestion = { text: "", answers: ["", "", "", ""], correct: 0 };
+      const [editingId, setEditingId] = useState(null);
+      const [teacherForm, setTeacherForm] = useState({ name: "", email: "", password: "", confirm: "" });
+      const [teacherError, setTeacherError] = useState("");
+      const [teacherSuccess, setTeacherSuccess] = useState("");
+      const [form, setForm] = useState({
+        title: "",
+        subject: "",
+        startDate: new Date().toISOString().slice(0, 10),
+        startTime: "10:00",
+        endTime: "11:00",
+        duration: 60,
+        questions: [structuredClone(emptyQuestion)]
+      });
+
+      function resetForm() {
+        setEditingId(null);
+        setForm({
+          title: "",
+          subject: "",
+          startDate: new Date().toISOString().slice(0, 10),
+          startTime: "10:00",
+          endTime: "11:00",
+          duration: 60,
+          questions: [structuredClone(emptyQuestion)]
+        });
+      }
+
+      function updateTeacherField(key, value) {
+        setTeacherForm(prev => ({ ...prev, [key]: value }));
+        setTeacherError("");
+        setTeacherSuccess("");
+      }
+
+      async function createTeacher(e) {
+        e.preventDefault();
+        const name = teacherForm.name.trim();
+        const email = teacherForm.email.trim();
+        if (!name) return setTeacherError("Укажите ФИО преподавателя.");
+        if (teacherForm.password.length < 3) return setTeacherError("Пароль должен содержать минимум 3 символа.");
+        if (teacherForm.password !== teacherForm.confirm) return setTeacherError("Пароли не совпадают.");
+        if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) return setTeacherError("Пользователь с таким email уже зарегистрирован.");
+
+        const teacher = {
+          id: crypto.randomUUID(),
+          name,
+          email,
+          role: "teacher",
+          passwordHash: await hashPassword(teacherForm.password)
+        };
+        persistUsers([...users, teacher]);
+        setTeacherForm({ name: "", email: "", password: "", confirm: "" });
+        setTeacherSuccess("Аккаунт преподавателя создан.");
+      }
+
+      function updateQuestion(index, patch) {
+        setForm(prev => ({
+          ...prev,
+          questions: prev.questions.map((q, i) => i === index ? { ...q, ...patch } : q)
+        }));
+      }
+
+      function updateAnswer(qIndex, aIndex, value) {
+        setForm(prev => ({
+          ...prev,
+          questions: prev.questions.map((q, i) => i === qIndex ? {
+            ...q,
+            answers: q.answers.map((a, idx) => idx === aIndex ? value : a)
+          } : q)
+        }));
+      }
+
+      function submit(e) {
+        e.preventDefault();
+        const normalized = {
+          ...form,
+          id: editingId || crypto.randomUUID(),
+          duration: Number(form.duration),
+          questions: form.questions.filter(q => q.text.trim()).map(q => ({
+            ...q,
+            text: q.text.trim(),
+            answers: q.answers.map(a => a.trim() || "Вариант ответа")
+          }))
+        };
+        if (!normalized.questions.length) return alert("Добавьте минимум один вопрос.");
+        const next = editingId ? tests.map(t => t.id === editingId ? normalized : t) : [normalized, ...tests];
+        persistTests(next);
+        resetForm();
+      }
+
+      function edit(test) {
+        setEditingId(test.id);
+        setForm(structuredClone(test));
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+
+      function remove(id) {
+        if (confirm("Удалить тест?")) persistTests(tests.filter(t => t.id !== id));
+      }
+
+      function exportExcel() {
+        const rows = results.map(r => `
+          <tr><td>${r.studentName}</td><td>${r.testTitle}</td><td>${r.score}/${r.total}</td><td>${r.warnings}</td><td>${r.status}</td><td>${r.finishedAt}</td></tr>
+        `).join("");
+        const html = `<table><thead><tr><th>ФИО студента</th><th>Тест</th><th>Баллы</th><th>Предупреждения</th><th>Статус</th><th>Дата</th></tr></thead><tbody>${rows}</tbody></table>`;
+        const blob = new Blob([`\ufeff${html}`], { type: "application/vnd.ms-excel;charset=utf-8" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = "examguard-results.xls";
+        link.click();
+        URL.revokeObjectURL(link.href);
+      }
+
+      const studentsCount = users.filter(u => u.role === "student").length;
+      const teachersCount = users.filter(u => u.role === "teacher").length;
+      const openTestsCount = tests.filter(t => testWindow(t).status === "open").length;
+      const violationResults = results.filter(r => r.warnings >= 3 || r.status.includes("наруш")).length;
+      const avgScore = results.length ? Math.round(results.reduce((sum, r) => sum + Number(r.score || 0), 0) / results.length) : 0;
+      const recentResults = results.slice(0, 4);
+
+      return (
+        <main className="mx-auto max-w-7xl space-y-8 px-4 py-8">
+          <section>
+            <div className="flex flex-col justify-between gap-3 md:flex-row md:items-end">
+              <div>
+                <h1 className="text-3xl font-black text-white">Личный кабинет преподавателя</h1>
+                <p className="mt-2 text-slate-400">Управление тестами, преподавателями, студентами и результатами экзаменов.</p>
+              </div>
+              <StatusPill>{teachersCount} преподаватель(ей) в системе</StatusPill>
+            </div>
+            <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+              <StatCard label="Студенты" value={studentsCount} note="Зарегистрированные учащиеся" />
+              <StatCard label="Тесты" value={tests.length} note={`${openTestsCount} сейчас доступно`} />
+              <StatCard label="Сдачи" value={results.length} note="Всего завершённых экзаменов" />
+              <StatCard label="Средний балл" value={`${avgScore}%`} note="По всем результатам" tone="amber" />
+              <StatCard label="Нарушения" value={violationResults} note="Автозавершения или 3 предупреждения" tone={violationResults ? "red" : "teal"} />
+            </div>
+            <div className="mt-6 rounded-md border border-slate-800 bg-slate-900 p-5">
+              <h2 className="text-xl font-bold">Последние сдачи</h2>
+              <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                {recentResults.length ? recentResults.map(r => (
+                  <div key={r.id} className="rounded-md border border-slate-800 bg-slate-950 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-semibold text-white">{r.studentName}</div>
+                        <div className="mt-1 text-sm text-slate-400">{r.testTitle} · {r.score}/{r.total}</div>
+                      </div>
+                      <StatusPill danger={r.warnings >= 3 || r.status.includes("наруш")}>{r.warnings} предупрежд.</StatusPill>
+                    </div>
+                    <div className="mt-2 text-xs text-slate-500">{r.finishedAt}</div>
+                  </div>
+                )) : (
+                  <div className="rounded-md border border-slate-800 bg-slate-950 p-4 text-sm text-slate-400">Пока нет завершённых экзаменов.</div>
+                )}
+              </div>
+            </div>
+          </section>
+
+          <section className="grid gap-6 lg:grid-cols-[1fr_0.9fr]">
+            <form onSubmit={submit} className="rounded-md border border-slate-800 bg-slate-900 p-5">
+              <div className="mb-5 flex items-center justify-between gap-4">
+                <h1 className="text-2xl font-bold">{editingId ? "Редактирование теста" : "Создание теста"}</h1>
+                {editingId && <Button type="button" variant="soft" onClick={resetForm}>Отменить</Button>}
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                <Field label="Название теста"><input className={inputClass} value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} required /></Field>
+                <Field label="Название предмета"><input className={inputClass} value={form.subject} onChange={e => setForm({ ...form, subject: e.target.value })} required /></Field>
+                <Field label="Дата начала"><input className={inputClass} type="date" value={form.startDate} onChange={e => setForm({ ...form, startDate: e.target.value })} required /></Field>
+                <Field label="Время начала"><input className={inputClass} type="time" value={form.startTime} onChange={e => setForm({ ...form, startTime: e.target.value })} required /></Field>
+                <Field label="Время окончания"><input className={inputClass} type="time" value={form.endTime} onChange={e => setForm({ ...form, endTime: e.target.value })} required /></Field>
+                <Field label="Продолжительность экзамена, минут"><input className={inputClass} type="number" min="1" value={form.duration} onChange={e => setForm({ ...form, duration: e.target.value })} required /></Field>
+              </div>
+
+              <div className="mt-5 space-y-4">
+                {form.questions.map((q, qIndex) => (
+                  <div key={qIndex} className="rounded-md border border-slate-800 bg-slate-950 p-4">
+                    <div className="mb-3 flex items-center justify-between">
+                      <div className="font-semibold">Вопрос {qIndex + 1}</div>
+                      <Button type="button" variant="soft" onClick={() => setForm(prev => ({ ...prev, questions: prev.questions.filter((_, i) => i !== qIndex) }))} disabled={form.questions.length === 1}>Удалить</Button>
+                    </div>
+                    <Field label="Текст вопроса"><input className={inputClass} value={q.text} onChange={e => updateQuestion(qIndex, { text: e.target.value })} required /></Field>
+                    <div className="mt-3 grid gap-3 md:grid-cols-2">
+                      {q.answers.map((answer, aIndex) => (
+                        <Field key={aIndex} label={`Вариант ${aIndex + 1}`}>
+                          <div className="flex gap-2">
+                            <input className={inputClass} value={answer} onChange={e => updateAnswer(qIndex, aIndex, e.target.value)} required />
+                            <input title="Правильный ответ" type="radio" name={`correct-${qIndex}`} checked={q.correct === aIndex} onChange={() => updateQuestion(qIndex, { correct: aIndex })} className="h-10 w-5 accent-teal-400" />
+                          </div>
+                        </Field>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-5 flex flex-wrap gap-3">
+                <Button type="button" variant="soft" onClick={() => setForm(prev => ({ ...prev, questions: [...prev.questions, structuredClone(emptyQuestion)] }))}>Добавить вопрос</Button>
+                <Button>{editingId ? "Сохранить изменения" : "Создать тест"}</Button>
+              </div>
+            </form>
+
+            <div className="space-y-6">
+              <section className="rounded-md border border-slate-800 bg-slate-900 p-5">
+                <h2 className="mb-4 text-xl font-bold">Создать преподавателя</h2>
+                <form onSubmit={createTeacher} className="space-y-4">
+                  <Field label="ФИО"><input className={inputClass} value={teacherForm.name} onChange={e => updateTeacherField("name", e.target.value)} required /></Field>
+                  <Field label="Email"><input className={inputClass} type="email" value={teacherForm.email} onChange={e => updateTeacherField("email", e.target.value)} required /></Field>
+                  <Field label="Пароль"><input className={inputClass} type="password" value={teacherForm.password} onChange={e => updateTeacherField("password", e.target.value)} required /></Field>
+                  <Field label="Подтверждение пароля"><input className={inputClass} type="password" value={teacherForm.confirm} onChange={e => updateTeacherField("confirm", e.target.value)} required /></Field>
+                  {teacherError && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">{teacherError}</div>}
+                  {teacherSuccess && <div className="rounded-md border border-teal-500/30 bg-teal-500/10 px-3 py-2 text-sm text-teal-200">{teacherSuccess}</div>}
+                  <Button className="w-full">Создать аккаунт преподавателя</Button>
+                </form>
+              </section>
+
+              <section className="rounded-md border border-slate-800 bg-slate-900 p-5">
+                <h2 className="mb-4 text-xl font-bold">Тесты преподавателя</h2>
+                <div className="space-y-3">
+                  {tests.map(test => {
+                    const availability = testWindow(test);
+                    return (
+                      <div key={test.id} className="rounded-md border border-slate-800 bg-slate-950 p-4">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="font-bold">{test.title}</div>
+                            <div className="mt-1 text-sm text-slate-400">{test.subject} · {test.questions.length} вопрос(ов) · {test.duration} мин</div>
+                            <div className="mt-1 text-xs text-slate-500">{test.startDate}, {test.startTime}-{test.endTime} · {availability.label}</div>
+                          </div>
+                          <div className="flex gap-2">
+                            <Button variant="soft" onClick={() => edit(test)}>Изм.</Button>
+                            <Button variant="danger" onClick={() => remove(test.id)}>Удал.</Button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section className="print-panel rounded-md border border-slate-800 bg-slate-900 p-5">
+            <div className="no-print mb-4 flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-xl font-bold">Результаты экзаменов</h2>
+              <div className="flex gap-2">
+                <Button variant="soft" onClick={() => window.print()}>Экспорт PDF</Button>
+                <Button onClick={exportExcel}>Экспорт Excel</Button>
+                <Button variant="danger" onClick={() => { if (confirm("Очистить результаты?")) persistResults([]); }}>Очистить</Button>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[760px] border-collapse text-left text-sm">
+                <thead className="border-b border-slate-800 text-slate-300">
+                  <tr>
+                    <th className="py-3 pr-4">ФИО студента</th>
+                    <th className="py-3 pr-4">Тест</th>
+                    <th className="py-3 pr-4">Баллы</th>
+                    <th className="py-3 pr-4">Предупреждения</th>
+                    <th className="py-3 pr-4">Статус экзамена</th>
+                    <th className="py-3 pr-4">Дата</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.map(r => (
+                    <tr key={r.id} className="border-b border-slate-800/70">
+                      <td className="py-3 pr-4 font-semibold">{r.studentName}</td>
+                      <td className="py-3 pr-4 text-slate-300">{r.testTitle}</td>
+                      <td className="py-3 pr-4">{r.score}/{r.total}</td>
+                      <td className={`py-3 pr-4 ${r.warnings >= 3 ? "font-bold text-red-300" : ""}`}>{r.warnings}</td>
+                      <td className="py-3 pr-4">{r.status}</td>
+                      <td className="py-3 pr-4 text-slate-400">{r.finishedAt}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </main>
+      );
+    }
+
+    function StudentDashboard({ currentUser, tests, results, startExam }) {
+      const studentResults = results.filter(r => {
+        if (r.studentEmail && currentUser?.email) return r.studentEmail.toLowerCase() === currentUser.email.toLowerCase();
+        return r.studentName === currentUser?.name;
+      });
+      const completedTestKeys = new Set(studentResults.map(r => r.testId || r.testTitle));
+      const openTests = tests.filter(t => testWindow(t).status === "open" && !completedTestKeys.has(t.id) && !completedTestKeys.has(t.title));
+      const scheduledTests = tests.filter(t => testWindow(t).status !== "open");
+      const avgScore = studentResults.length ? Math.round(studentResults.reduce((sum, r) => sum + Number(r.score || 0), 0) / studentResults.length) : 0;
+      const totalWarnings = studentResults.reduce((sum, r) => sum + Number(r.warnings || 0), 0);
+      const drafts = tests.map(test => {
+        const saved = storage.get(`eg_answers_${test.id}`, {});
+        return { test, answered: Object.keys(saved || {}).length };
+      }).filter(item => item.answered > 0 && !completedTestKeys.has(item.test.id) && !completedTestKeys.has(item.test.title));
+
+      return (
+        <main className="mx-auto max-w-7xl space-y-8 px-4 py-8">
+          <section className="grid gap-6 lg:grid-cols-[360px_1fr]">
+            <aside className="rounded-md border border-slate-800 bg-slate-900 p-5">
+              <div className="flex items-center gap-4">
+                <div className="grid h-16 w-16 place-items-center rounded-md bg-teal-400 text-2xl font-black text-slate-950">
+                  {(currentUser?.name || "С").slice(0, 1).toUpperCase()}
+                </div>
+                <div>
+                  <h1 className="text-2xl font-black text-white">Личный кабинет студента</h1>
+                  <p className="mt-1 text-sm text-slate-400">{currentUser?.name}</p>
+                </div>
+              </div>
+              <div className="mt-5 space-y-3 text-sm">
+                <div className="flex justify-between border-b border-slate-800 pb-2"><span className="text-slate-400">Email</span><span className="text-right text-slate-200">{currentUser?.email}</span></div>
+                <div className="flex justify-between border-b border-slate-800 pb-2"><span className="text-slate-400">Роль</span><span className="text-slate-200">Студент</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Статус</span><StatusPill>Активен</StatusPill></div>
+              </div>
+            </aside>
+
+            <div>
+              <p className="text-slate-400">Здесь собраны доступные экзамены, черновики ответов, завершённые тесты и результаты прокторинга.</p>
+              <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <StatCard label="Доступно сейчас" value={openTests.length} note="Можно начать тестирование" />
+                <StatCard label="Сдано тестов" value={studentResults.length} note="История попыток" />
+                <StatCard label="Средний балл" value={`${avgScore}%`} note="По вашим сдачам" tone="amber" />
+                <StatCard label="Предупреждения" value={totalWarnings} note="Всего по экзаменам" tone={totalWarnings ? "red" : "teal"} />
+              </div>
+            </div>
+          </section>
+
+          <section className="grid gap-6 lg:grid-cols-[1fr_360px]">
+            <div className="rounded-md border border-slate-800 bg-slate-900 p-5">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <h2 className="text-xl font-bold">Доступные тесты</h2>
+                <StatusPill muted>{tests.length} всего</StatusPill>
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                {tests.map(test => {
+                  const availability = testWindow(test);
+                  const completed = completedTestKeys.has(test.id) || completedTestKeys.has(test.title);
+                  const isOpen = availability.status === "open" && !completed;
+                  return (
+                    <article key={test.id} className="rounded-md border border-slate-800 bg-slate-950 p-5">
+                      <div className="mb-4 flex items-start justify-between gap-3">
+                        <StatusPill danger={availability.status === "closed"} muted={availability.status === "scheduled" || completed}>
+                          {completed ? "Сдан" : availability.label}
+                        </StatusPill>
+                        <span className="text-xs text-slate-500">{test.questions.length} вопрос(ов)</span>
+                      </div>
+                      <h3 className="text-xl font-bold">{test.title}</h3>
+                      <p className="mt-1 text-slate-400">{test.subject}</p>
+                      <div className="mt-4 grid gap-2 text-sm text-slate-300">
+                        <div>Дата: {test.startDate}</div>
+                        <div>Время: {test.startTime}-{test.endTime}</div>
+                        <div>Продолжительность: {test.duration} минут</div>
+                      </div>
+                      <Button className="mt-5 w-full" disabled={!isOpen} onClick={() => startExam(test)}>
+                        {completed ? "Тест уже сдан" : isOpen ? "Начать тестирование" : "Недоступен"}
+                      </Button>
+                    </article>
+                  );
+                })}
+              </div>
+            </div>
+
+            <aside className="space-y-6">
+              <section className="rounded-md border border-slate-800 bg-slate-900 p-5">
+                <h2 className="text-xl font-bold">Черновики ответов</h2>
+                <div className="mt-4 space-y-3">
+                  {drafts.length ? drafts.map(({ test, answered }) => (
+                    <div key={test.id} className="rounded-md border border-slate-800 bg-slate-950 p-4">
+                      <div className="font-semibold">{test.title}</div>
+                      <div className="mt-1 text-sm text-slate-400">Сохранено ответов: {answered}/{test.questions.length}</div>
+                      <Button className="mt-3 w-full" variant="soft" disabled={testWindow(test).status !== "open"} onClick={() => startExam(test)}>Продолжить</Button>
+                    </div>
+                  )) : <p className="text-sm text-slate-400">Нет незавершённых ответов.</p>}
+                </div>
+              </section>
+
+              <section className="rounded-md border border-slate-800 bg-slate-900 p-5">
+                <h2 className="text-xl font-bold">Расписание</h2>
+                <div className="mt-4 space-y-3">
+                  {scheduledTests.length ? scheduledTests.slice(0, 5).map(test => (
+                    <div key={test.id} className="rounded-md border border-slate-800 bg-slate-950 p-3 text-sm">
+                      <div className="font-semibold text-white">{test.title}</div>
+                      <div className="mt-1 text-slate-400">{test.startDate}, {test.startTime}-{test.endTime}</div>
+                    </div>
+                  )) : <p className="text-sm text-slate-400">Все тесты сейчас доступны или уже сданы.</p>}
+                </div>
+              </section>
+            </aside>
+          </section>
+
+          <section className="rounded-md border border-slate-800 bg-slate-900 p-5">
+            <h2 className="text-xl font-bold">Сданные тесты и результаты</h2>
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full min-w-[760px] border-collapse text-left text-sm">
+                <thead className="border-b border-slate-800 text-slate-300">
+                  <tr>
+                    <th className="py-3 pr-4">Тест</th>
+                    <th className="py-3 pr-4">Баллы</th>
+                    <th className="py-3 pr-4">Предупреждения</th>
+                    <th className="py-3 pr-4">Статус</th>
+                    <th className="py-3 pr-4">Дата сдачи</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {studentResults.length ? studentResults.map(r => (
+                    <tr key={r.id} className="border-b border-slate-800/70">
+                      <td className="py-3 pr-4 font-semibold">{r.testTitle}</td>
+                      <td className="py-3 pr-4">{r.score}/{r.total}</td>
+                      <td className={`py-3 pr-4 ${r.warnings >= 3 ? "font-bold text-red-300" : ""}`}>{r.warnings}/3</td>
+                      <td className="py-3 pr-4"><StatusPill danger={r.warnings >= 3 || r.status.includes("наруш")}>{r.status}</StatusPill></td>
+                      <td className="py-3 pr-4 text-slate-400">{r.finishedAt}</td>
+                    </tr>
+                  )) : (
+                    <tr><td className="py-6 text-slate-400" colSpan="5">Вы ещё не сдавали тесты.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </main>
+      );
+    }
+
+    function Exam({ currentUser, test, finishExam }) {
+      const [answers, setAnswers] = useState(() => storage.get(`eg_answers_${test.id}`, {}));
+      const [questionIndex, setQuestionIndex] = useState(0);
+      const [secondsLeft, setSecondsLeft] = useState(Number(test.duration) * 60);
+      const [warnings, setWarnings] = useState([]);
+      const [events, setEvents] = useState(["Экзамен начат"]);
+      const [cameraState, setCameraState] = useState("Запуск камеры");
+      const [proctorState, setProctorState] = useState("Нарушений не обнаружено");
+      const videoRef = useRef(null);
+      const finishedRef = useRef(false);
+      const streamRef = useRef(null);
+      const answersRef = useRef(answers);
+      const warningsRef = useRef(warnings);
+      const eventsRef = useRef(events);
+
+      const currentQuestion = test.questions[questionIndex];
+      const warningLimitReached = warnings.length >= 3;
+
+      useEffect(() => {
+        storage.set(`eg_answers_${test.id}`, answers);
+        answersRef.current = answers;
+      }, [answers, test.id]);
+
+      useEffect(() => {
+        warningsRef.current = warnings;
+      }, [warnings]);
+
+      useEffect(() => {
+        eventsRef.current = events;
+      }, [events]);
+
+      useEffect(() => {
+        let mounted = true;
+        navigator.mediaDevices?.getUserMedia({ video: true, audio: false })
+          .then(stream => {
+            if (!mounted) return;
+            streamRef.current = stream;
+            videoRef.current.srcObject = stream;
+            setCameraState("Камера активна");
+          })
+          .catch(() => {
+            setCameraState("Камера отключена или закрыта");
+            addWarning("Камера отключена или закрыта");
+          });
+        return () => {
+          mounted = false;
+          streamRef.current?.getTracks().forEach(track => track.stop());
+        };
+      }, []);
+
+      useEffect(() => {
+        const timer = setInterval(() => {
+          setSecondsLeft(prev => {
+            if (prev <= 1) {
+              clearInterval(timer);
+              complete(true, "Экзамен завершён успешно");
+              return 0;
+            }
+            return prev - 1;
+          });
+        }, 1000);
+        return () => clearInterval(timer);
+      }, []);
+
+      useEffect(() => {
+        const onVisibility = () => {
+          if (document.hidden) addWarning("Пользователь переключился на другую вкладку");
+        };
+        const onBlur = () => addWarning("Пользователь открыл другое приложение или окно потеряло фокус");
+        document.addEventListener("visibilitychange", onVisibility);
+        window.addEventListener("blur", onBlur);
+        return () => {
+          document.removeEventListener("visibilitychange", onVisibility);
+          window.removeEventListener("blur", onBlur);
+        };
+      }, [warnings]);
+
+      useEffect(() => {
+        const checks = [
+          "Лицо отсутствует в кадре",
+          "В кадре обнаружено более одного человека",
+          "Камера отключена или закрыта"
+        ];
+        const interval = setInterval(() => {
+          const chance = Math.random();
+          if (chance < 0.18) {
+            const reason = checks[Math.floor(Math.random() * checks.length)];
+            setProctorState(reason);
+            addWarning(reason);
+          } else {
+            setProctorState("Лицо обнаружено, нарушений не найдено");
+          }
+        }, 12000);
+        return () => clearInterval(interval);
+      }, [warnings]);
+
+      useEffect(() => {
+        if (warningLimitReached) complete(false, "Экзамен завершён автоматически из-за нарушений");
+      }, [warningLimitReached]);
+
+      function addWarning(reason) {
+        if (finishedRef.current) return;
+        setWarnings(prev => {
+          if (prev.length >= 3) return prev;
+          const next = [...prev, { number: prev.length + 1, reason, at: new Date().toLocaleTimeString("ru-RU") }];
+          setEvents(eventsPrev => {
+            const eventNext = [...eventsPrev, `Предупреждение №${next.length}: ${reason}`];
+            eventsRef.current = eventNext;
+            return eventNext;
+          });
+          warningsRef.current = next;
+          return next;
+        });
+      }
+
+      function complete(success, status) {
+        if (finishedRef.current) return;
+        finishedRef.current = true;
+        streamRef.current?.getTracks().forEach(track => track.stop());
+        const latestAnswers = answersRef.current;
+        const latestWarnings = warningsRef.current;
+        const latestEvents = eventsRef.current;
+        const correct = test.questions.reduce((sum, q, idx) => sum + (Number(latestAnswers[idx]) === q.correct ? 1 : 0), 0);
+        const total = test.questions.length;
+        const score = Math.round((correct / total) * 100);
+        const finalEvents = [...latestEvents, success ? "Экзамен завершён штатно" : "Автоматическое завершение после третьего предупреждения"];
+        storage.set(`eg_answers_${test.id}`, latestAnswers);
+        finishExam({
+          id: crypto.randomUUID(),
+          studentName: currentUser?.name || "Студент",
+          studentEmail: currentUser?.email || "",
+          testId: test.id,
+          testTitle: test.title,
+          score,
+          total: 100,
+          warnings: Math.max(latestWarnings.length, success ? latestWarnings.length : 3),
+          status,
+          events: finalEvents,
+          finishedAt: new Date().toLocaleString("ru-RU")
+        });
+      }
+
+      const minutes = String(Math.floor(secondsLeft / 60)).padStart(2, "0");
+      const seconds = String(secondsLeft % 60).padStart(2, "0");
+
+      return (
+        <main className="mx-auto grid max-w-7xl gap-6 px-4 py-6 lg:grid-cols-[1fr_360px]">
+          <section className="rounded-md border border-slate-800 bg-slate-900 p-5">
+            <div className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+              <div>
+                <h1 className="text-2xl font-bold">{test.title}</h1>
+                <p className="text-sm text-slate-400">{test.subject} · Студент: {currentUser?.name}</p>
+              </div>
+              <div className="rounded-md border border-red-400/30 bg-red-500/10 px-4 py-2 font-mono text-xl font-bold text-red-200">
+                {minutes}:{seconds}
+              </div>
+            </div>
+
+            <div className="mb-5 flex flex-wrap gap-2">
+              {test.questions.map((_, idx) => (
+                <button key={idx} onClick={() => setQuestionIndex(idx)} className={`h-10 w-10 rounded-md border text-sm font-bold ${idx === questionIndex ? "border-teal-300 bg-teal-400 text-slate-950" : answers[idx] !== undefined ? "border-teal-400/40 bg-teal-400/10 text-teal-200" : "border-slate-700 bg-slate-950 text-slate-300"}`}>
+                  {idx + 1}
+                </button>
+              ))}
+            </div>
+
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-wide text-teal-200">Вопрос {questionIndex + 1} из {test.questions.length}</div>
+              <h2 className="mt-2 text-2xl font-bold">{currentQuestion.text}</h2>
+              <div className="mt-5 space-y-3">
+                {currentQuestion.answers.map((answer, idx) => (
+                  <label key={idx} className={`flex cursor-pointer items-center gap-3 rounded-md border p-4 transition ${Number(answers[questionIndex]) === idx ? "border-teal-300 bg-teal-400/10" : "border-slate-800 bg-slate-950 hover:border-slate-600"}`}>
+                    <input type="radio" name={`answer-${questionIndex}`} checked={Number(answers[questionIndex]) === idx} onChange={() => setAnswers(prev => ({ ...prev, [questionIndex]: idx }))} className="h-5 w-5 accent-teal-400" />
+                    <span>{answer}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-8 flex flex-wrap justify-between gap-3 border-t border-slate-800 pt-4">
+              <Button variant="soft" disabled={questionIndex === 0} onClick={() => setQuestionIndex(i => i - 1)}>Назад</Button>
+              <div className="flex gap-3">
+                <Button variant="soft" disabled={questionIndex === test.questions.length - 1} onClick={() => setQuestionIndex(i => i + 1)}>Далее</Button>
+                <Button onClick={() => complete(true, "Экзамен завершён успешно")}>Завершить экзамен</Button>
+              </div>
+            </div>
+          </section>
+
+          <aside className="space-y-4">
+            <div className="rounded-md border border-slate-800 bg-slate-900 p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <h2 className="font-bold">Прокторинг</h2>
+                <span className={`rounded-md px-2 py-1 text-xs font-semibold ${warnings.length ? "bg-amber-400/10 text-amber-200" : "bg-teal-400/10 text-teal-200"}`}>
+                  {warnings.length}/3
+                </span>
+              </div>
+              <video ref={videoRef} autoPlay playsInline muted className="h-56 w-full rounded-md border border-slate-800 bg-slate-950 object-cover" />
+              <div className="mt-3 text-sm text-slate-300">{cameraState}</div>
+              <div className="mt-1 text-sm text-slate-400">AI-статус: {proctorState}</div>
+              <Button variant="danger" className="mt-3 w-full" onClick={() => addWarning("Тестовое нарушение прокторинга")}>Сымитировать нарушение</Button>
+            </div>
+
+            <div className="rounded-md border border-slate-800 bg-slate-900 p-4">
+              <h2 className="font-bold">Система предупреждений</h2>
+              <div className="mt-3 grid grid-cols-3 gap-2">
+                {[1, 2, 3].map(n => (
+                  <div key={n} className={`rounded-md border p-3 text-center text-sm font-bold ${warnings.length >= n ? "border-red-400 bg-red-500/10 text-red-200" : "border-slate-800 bg-slate-950 text-slate-500"}`}>
+                    №{n}
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 max-h-44 space-y-2 overflow-auto text-sm">
+                {warnings.length === 0 ? <p className="text-slate-400">Нарушений не зафиксировано.</p> : warnings.map(w => (
+                  <div key={`${w.number}-${w.at}`} className="rounded-md bg-slate-950 p-2 text-slate-300">
+                    Предупреждение №{w.number}: {w.reason}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </aside>
+        </main>
+      );
+    }
+
+    function Footer() {
+      return (
+        <footer className="no-print mt-10 border-t border-slate-800">
+          <div className="mx-auto flex max-w-7xl flex-col gap-2 px-4 py-6 text-sm text-slate-400 md:flex-row md:items-center md:justify-between">
+            <div>Контакты: support@examguard.local · +7 (700) 000-00-00</div>
+            <div>Стек: React.js, Tailwind CSS, Node.js, Express.js, PostgreSQL, JWT, TensorFlow.js, MediaPipe, WebRTC</div>
+          </div>
+        </footer>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
